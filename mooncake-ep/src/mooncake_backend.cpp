@@ -791,7 +791,6 @@ void MooncakeBackend::processSendOp(const P2POp& op) {
     std::vector<std::string> keys = {slotAllocKey};
     int baseSlot = 0;
     int allocatedSlots = 0;
-    int pollCounter = 0;
     while (true) {
         if (meta_.store->check(keys)) {
             auto slotValue = meta_.store->get(slotAllocKey);
@@ -816,10 +815,8 @@ void MooncakeBackend::processSendOp(const P2POp& op) {
             }
         }
         std::this_thread::sleep_for(std::chrono::microseconds(10));
-        // Periodically yield to allow polling of pending transfers
-        if (++pollCounter % 100 == 0) {
-            yieldForPendingTransfers();
-        }
+        // Poll pending transfers every iteration for better responsiveness
+        yieldForPendingTransfers();
     }
 
     const std::string ctrlKey =
@@ -983,20 +980,14 @@ void MooncakeBackend::processRecvOp(const P2POp& op) {
     // Allocate slot based on receiver's sequence.
     int baseSlot = static_cast<int>(seq % kP2PNumSlots);
     
-    // Poll counter for yielding to pending transfers (reused across wait loops)
-    int pollCounter = 0;
-    
     // Wait for slot request from sender.
     const std::string slotRequestKey =
         makeP2PSlotKey(meta_.backendIndex, srcRank, rank_, tag, seq);
     std::vector<std::string> keys = {slotRequestKey};
-    pollCounter = 0;
     while (!meta_.store->check(keys)) {
         std::this_thread::sleep_for(std::chrono::microseconds(10));
-        // Periodically yield to allow polling of pending transfers (for send ops)
-        if (++pollCounter % 100 == 0) {
-            yieldForPendingTransfers();
-        }
+        // Poll pending transfers every iteration for better responsiveness
+        yieldForPendingTransfers();
     }
     
     // Parse slot request: "numSlotsNeeded_numBytes"
@@ -1018,7 +1009,6 @@ void MooncakeBackend::processRecvOp(const P2POp& op) {
     
     // Check if we need to wait for slots to become available.
     if (baseSlot + numSlotsNeeded > static_cast<int>(kP2PNumSlots)) {
-        pollCounter = 0;
         while (seq >= meta_.p2pRecvLowestInFlight[srcRank] + kP2PNumSlots) {
             const int64_t waitSeq = meta_.p2pRecvLowestInFlight[srcRank];
             const std::string doneKey = makeP2PDoneKey(meta_.backendIndex, srcRank,
@@ -1026,10 +1016,8 @@ void MooncakeBackend::processRecvOp(const P2POp& op) {
             std::vector<std::string> doneKeys = {doneKey};
             while (!meta_.store->check(doneKeys)) {
                 std::this_thread::sleep_for(std::chrono::microseconds(10));
-                // Periodically yield to allow polling of pending transfers (for send ops)
-                if (++pollCounter % 100 == 0) {
-                    yieldForPendingTransfers();
-                }
+                // Poll pending transfers every iteration for better responsiveness
+                yieldForPendingTransfers();
             }
             meta_.store->get(doneKey);
             ++meta_.p2pRecvLowestInFlight[srcRank];
@@ -1041,13 +1029,10 @@ void MooncakeBackend::processRecvOp(const P2POp& op) {
             const std::string doneKey = makeP2PDoneKey(meta_.backendIndex, srcRank,
                                                        rank_, tag, waitSeq);
             std::vector<std::string> doneKeys = {doneKey};
-            pollCounter = 0;
             while (!meta_.store->check(doneKeys)) {
                 std::this_thread::sleep_for(std::chrono::microseconds(10));
-                // Periodically yield to allow polling of pending transfers (for send ops)
-                if (++pollCounter % 100 == 0) {
-                    yieldForPendingTransfers();
-                }
+                // Poll pending transfers every iteration for better responsiveness
+                yieldForPendingTransfers();
             }
             meta_.store->get(doneKey);
             ++meta_.p2pRecvLowestInFlight[srcRank];
@@ -1062,13 +1047,10 @@ void MooncakeBackend::processRecvOp(const P2POp& op) {
     
     // Wait for sender to complete data transfer and publish control message.
     std::vector<std::string> ctrlKeys = {ctrlKey};
-    pollCounter = 0;
     while (!meta_.store->check(ctrlKeys)) {
         std::this_thread::sleep_for(std::chrono::microseconds(10));
-        // Periodically yield to allow polling of pending transfers (for send ops)
-        if (++pollCounter % 100 == 0) {
-            yieldForPendingTransfers();
-        }
+        // Poll pending transfers every iteration for better responsiveness
+        yieldForPendingTransfers();
     }
     auto ctrlValue = meta_.store->get(ctrlKey);
     std::string ctrlStr(ctrlValue.begin(), ctrlValue.end());

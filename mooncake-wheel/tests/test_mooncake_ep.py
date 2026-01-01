@@ -7,6 +7,7 @@ import mooncake.ep
 from mooncake.mooncake_ep_buffer import Buffer
 from ep_test_utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
 
+mooncake.ep.set_device_filter(["mlx5_1", "mlx5_2", "mlx5_3", "mlx5_4"])
 
 def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
               rank: int, num_ranks: int, group: dist.ProcessGroup, cpu_group: dist.ProcessGroup, buffer: Buffer, seed: int = 0):
@@ -159,13 +160,13 @@ def test_loop(local_rank: int, num_local_ranks: int):
 
     test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, cpu_group, buffer, seed=1)
 
-    do_pressure_test = False
+    do_pressure_test = True
     for seed in range(int(1e9) if do_pressure_test else 0):
         if local_rank == 0:
             print(f'Testing with seed {seed} ...', flush=True)
-        ref_hash = test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=seed)
+        ref_hash = test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, cpu_group,buffer, seed=seed)
         for i in range(20):
-            assert test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=seed) == ref_hash, f'Error: seed={seed}'
+            assert test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, cpu_group,buffer, seed=seed) == ref_hash, f'Error: seed={seed}'
 
 
 if __name__ == '__main__':

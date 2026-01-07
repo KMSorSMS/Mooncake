@@ -538,7 +538,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
             c10d::OpType::ALLTOALL, tensorSize, 0, &meta_,
             [=](void* dst, size_t pos, size_t realSize) {
                 for (const auto j : c10::irange(inputTensors.size())) {
-                    memcpy(dst + j * realSize,
+                    memcpy((char *)dst + j * realSize,
                            (char*)inputTensors[j].data_ptr() + pos, realSize);
                 }
             },
@@ -555,7 +555,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
             c10d::OpType::ALLTOALL, tensorSize, 0, &meta_, stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 for (const auto j : c10::irange(inputTensors.size())) {
-                    cudaMemcpyAsync(dst + j * realSize,
+                    cudaMemcpyAsync((char*)dst + j * realSize,
                                     (char*)inputTensors[j].data_ptr() + pos,
                                     realSize, cudaMemcpyHostToDevice, stream);
                 }

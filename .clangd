@@ -1,0 +1,25 @@
+CompileFlags:
+  Remove:
+    - "-forward-unknown-to-host-compiler"
+    - "--options-file*"
+    - "-Xcudafe*"
+    - "-Xcompiler*"
+    - "-gencode*"
+    - "--expt-*"
+    - "--diag_suppress*"
+
+Diagnostics:
+  Suppress:
+    - "typecheck_pointer_arith_void_type"
+
+---
+
+If:
+  PathMatch: .*\.(cu|cuh)$
+CompileFlags:
+  Add:
+    - "-ferror-limit=0"
+    - "-xcuda"
+    - "--cuda-gpu-arch=sm_80"
+Diagnostics:
+  Suppress: "*"

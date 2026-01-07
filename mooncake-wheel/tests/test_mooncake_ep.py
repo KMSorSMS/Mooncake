@@ -150,6 +150,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
 
 # noinspection PyUnboundLocalVariable
 def test_loop(local_rank: int, num_local_ranks: int):
+    print(f'Process started: local_rank={local_rank},num_local_ranks={num_local_ranks}', flush=True)
     rank, num_ranks, group, cpu_group = init_dist(local_rank, num_local_ranks)
     num_tokens, hidden, num_topk, num_experts = 128, 7168, 8, 288
 
@@ -171,5 +172,5 @@ def test_loop(local_rank: int, num_local_ranks: int):
 
 if __name__ == '__main__':
     # TODO: you may modify NUMA binding for less CPU overhead
-    num_processes = 2
+    num_processes = 4
     torch.multiprocessing.spawn(test_loop, args=(num_processes,), nprocs=num_processes)

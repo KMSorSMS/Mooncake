@@ -1508,12 +1508,25 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
                                                    bool allow_failover) {
     auto& task = batch->task_list[task_id];
     task.status = task_status.s;
-    if (!allow_failover || task_status.s != FAILED || task.type == UNSPEC)
+    // Only a routable transport failure is recoverable via failover.
+    if (task_status.s != FAILED || task.type == UNSPEC) {
+        task.failover_pending = false;
         return;
+    }
+
+    if (!allow_failover) {
+        // Observation-only poll: record a recoverable ("soft") failure that an
+        // explicit progressBatch()/worker pass can still fail over later.
+        task.failover_pending = true;
+        return;
+    }
 
     if (resubmitTransferTask(batch, task_id).ok()) {
         task_status.s = PENDING;
         task.status = PENDING;
+        task.failover_pending = false;
+    } else {
+        task.failover_pending = false;  // failover exhausted -> hard failure
     }
 }
 
@@ -1630,6 +1643,17 @@ Status TransferEngineImpl::getBatchStatusLocked(Batch* batch,
         total_tasks++;
         TransferStatus task_status;
         if (task.status != PENDING) {
+            // A soft failure recorded by an observation-only status query can
+            // still be failed over by a failover-capable progress pass.
+            if (allow_failover && task.status == FAILED &&
+                task.failover_pending) {
+                if (resubmitTransferTask(batch, task_id).ok()) {
+                    task.status = PENDING;
+                    task.failover_pending = false;
+                    continue;  // back in flight; polled on a later pass
+                }
+                task.failover_pending = false;  // failover exhausted -> hard failure
+            }
             if (task.status == COMPLETED) {
                 success_tasks++;
                 overall_status.transferred_bytes += task.request.length;

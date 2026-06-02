@@ -621,7 +621,69 @@ TEST(TransportTerminalEvent, NotifyDrivesAutoFailover) {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Worker disabled: notifyTerminal is benign.
+// 8. Explicit progress can revive a failure observed by a status query.
+// ---------------------------------------------------------------------------
+
+TEST(BatchLifecycle, ProgressBatchRecoversFailureObservedByStatusQuery) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_auto_failover_on_poll", false);
+    cfg->set("enable_progress_worker", false);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+
+    FaultPolicy rdma_policy;
+    rdma_policy.status_corrupt_rate = 1.0;
+    auto proxied_rdma =
+        std::make_shared<FaultProxyTransport>(fake_rdma, rdma_policy);
+
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(proxied_rdma->install(seg, nullptr, nullptr).ok());
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, proxied_rdma);
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> buf(kBufLen, 0xD9);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+    BatchID batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, (BatchID)0);
+
+    Request req;
+    req.opcode = Request::WRITE;
+    req.source = buf.data();
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.target_offset = reinterpret_cast<uint64_t>(buf.data());
+    req.length = kBufLen;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {req}).ok());
+
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    EXPECT_EQ(fake_tcp->submit_calls.load(), 0)
+        << "observation-only status query must not fail over";
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < deadline) {
+        status = {};
+        ASSERT_TRUE(engine.progressBatch(batch_id, status).ok());
+        if (status.s == TransferStatusEnum::COMPLETED) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED)
+        << "progressBatch must recover a soft failure observed by status";
+    EXPECT_GE(fake_tcp->submit_calls.load(), 1);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+// ---------------------------------------------------------------------------
+// 9. Worker disabled: notifyTerminal is benign.
 // ---------------------------------------------------------------------------
 
 TEST(TransportTerminalEvent, WorkerDisabledNotifyIsNoop) {
@@ -669,7 +731,7 @@ TEST(TransportTerminalEvent, WorkerDisabledNotifyIsNoop) {
 }
 
 // ---------------------------------------------------------------------------
-// 9. A pending free keeps its event sink until the worker can reclaim it.
+// 10. A pending free keeps its event sink until the worker can reclaim it.
 // ---------------------------------------------------------------------------
 
 TEST(BatchLifecycle, PendingFreeKeepsSinkUntilReclaim) {
@@ -735,7 +797,7 @@ TEST(BatchLifecycle, PendingFreeKeepsSinkUntilReclaim) {
 }
 
 // ---------------------------------------------------------------------------
-// 10. Once freeBatch reclaims a batch, public APIs reject the stale id.
+// 11. Once freeBatch reclaims a batch, public APIs reject the stale id.
 // ---------------------------------------------------------------------------
 
 TEST(BatchLifecycle, FreedBatchRejectsPublicApi) {
@@ -785,7 +847,7 @@ TEST(BatchLifecycle, FreedBatchRejectsPublicApi) {
 }
 
 // ---------------------------------------------------------------------------
-// 11. Teardown reclaims a pending free-requested batch with a live sink.
+// 12. Teardown reclaims a pending free-requested batch with a live sink.
 // ---------------------------------------------------------------------------
 
 TEST(BatchLifecycle, DestructorReclaimsPendingFreeRequestedBatch) {
@@ -840,7 +902,7 @@ TEST(BatchLifecycle, DestructorReclaimsPendingFreeRequestedBatch) {
 }
 
 // ---------------------------------------------------------------------------
-// 12. Free-batch races a transport terminal event.
+// 13. Free-batch races a transport terminal event.
 //    Submit + free + concurrent terminal notifications must remain UAF-safe;
 //    stable-id registry lookup, per-batch locking, and reclaim-time sink close
 //    keep late worker events benign.
@@ -890,7 +952,7 @@ TEST(TransportTerminalEvent, FreeBatchRaceWithTransportTerminal) {
 }
 
 // ---------------------------------------------------------------------------
-// 13. A late transport-owned sink from a freed+reclaimed batch must be a no-op.
+// 14. A late transport-owned sink from a freed+reclaimed batch must be a no-op.
 //     Stable IDs are never reused, so a stale/closed sink cannot touch a
 //     different live batch.
 // ---------------------------------------------------------------------------

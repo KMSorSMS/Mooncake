@@ -434,7 +434,7 @@ TEST(EngineFailoverE2E, ProgressBatchRetriesWhenPollAutoFailoverDisabled) {
         engine.unregisterLocalMemory(batch.buf.data(), batch.buf.size()).ok());
 }
 
-TEST(EngineFailoverE2E, ProgressBatchDoesNotReviveObservedFailedTask) {
+TEST(EngineFailoverE2E, ProgressBatchRevivesObservedFailedTask) {
     auto cfg = makeMinimalP2PConfig();
     cfg->set("enable_auto_failover_on_poll", false);
     TransferEngineImpl engine(cfg);
@@ -443,14 +443,19 @@ TEST(EngineFailoverE2E, ProgressBatchDoesNotReviveObservedFailedTask) {
     CorruptedRdmaBatch batch;
     submitCorruptedRdmaBatch(engine, batch, 0xA5);
 
+    // Observation-only poll: it sees the failure and records it as a soft
+    // failure, but does not fail over (auto-failover-on-poll disabled).
     TransferStatus overall_status{};
     ASSERT_TRUE(engine.getTransferStatus(batch.batch_id, overall_status).ok());
     EXPECT_EQ(overall_status.s, TransferStatusEnum::FAILED);
     EXPECT_EQ(batch.fake_tcp->submit_calls.load(), 0);
 
+    // A failover-capable progressBatch pass takes over the soft failure:
+    // it resubmits to the secondary transport and revives the task to
+    // PENDING.
     ASSERT_TRUE(engine.progressBatch(batch.batch_id, overall_status).ok());
-    EXPECT_EQ(overall_status.s, TransferStatusEnum::FAILED);
-    EXPECT_EQ(batch.fake_tcp->submit_calls.load(), 0);
+    EXPECT_EQ(overall_status.s, TransferStatusEnum::PENDING);
+    EXPECT_EQ(batch.fake_tcp->submit_calls.load(), 1);
 
     EXPECT_TRUE(engine.freeBatch(batch.batch_id).ok());
     EXPECT_TRUE(

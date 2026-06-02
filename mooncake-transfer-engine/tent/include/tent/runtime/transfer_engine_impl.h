@@ -24,20 +24,17 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "tent/common/config.h"
 #include "tent/common/status.h"
 #include "tent/common/types.h"
-#include "tent/common/concurrent/thread_local_storage.h"
 #include "tent/runtime/transport_selector.h"
 
 namespace mooncake {
 namespace tent {
 
 class Batch;
-class BatchSet;
 class Topology;
 class Transport;
 class SegmentDesc;
@@ -155,7 +152,7 @@ class TransferEngineImpl {
 
     Status progressBatch(BatchID batch_id, TransferStatus& overall_status);
 
-    Status progressBatchIfAlive(BatchID batch_id, uint64_t generation,
+    Status progressBatchIfAlive(BatchID batch_id,
                                 TransferStatus& overall_status);
 
     Status waitTransferCompletion(BatchID batch_id);
@@ -183,16 +180,12 @@ class TransferEngineImpl {
     // hooks; transports will be migrated to call this in a follow-up PR.
     void notifyBatchMaybeReady(BatchID batch_id);
 
-    void notifyBatchMaybeReady(BatchID batch_id, uint64_t generation);
-
    private:
     Status construct();
 
     Status deconstruct();
 
     Status setupLocalSegment();
-
-    Status lazyFreeBatch();
 
     SelectionResult getTransportType(const Request& request,
                                      int transport_index = 0);
@@ -216,6 +209,27 @@ class TransferEngineImpl {
     Status getBatchStatus(BatchID batch_id, TransferStatus& overall_status,
                           bool allow_failover);
 
+    enum class BatchLookupMode { ACTIVE_ONLY, ALLOW_FREE_REQUESTED };
+
+    struct LockedBatch {
+        std::shared_ptr<Batch> batch;
+        std::unique_lock<std::mutex> lock;
+        explicit operator bool() const { return static_cast<bool>(batch); }
+    };
+
+    LockedBatch acquireBatch(BatchID batch_id, BatchLookupMode mode);
+
+    Status submitTransferLocked(Batch* batch,
+                                const std::vector<Request>& request_list);
+
+    Status getTransferStatusLocked(Batch* batch, size_t task_id,
+                                   TransferStatus& task_status);
+
+    Status getBatchStatusLocked(Batch* batch, TransferStatus& overall_status,
+                                bool allow_failover);
+
+    void reclaimBatchLocked(const std::shared_ptr<Batch>& batch);
+
     SelectionResult resolveTransport(const Request& req, int transport_index,
                                      bool invalidate_on_fail = true);
 
@@ -230,7 +244,6 @@ class TransferEngineImpl {
                                      TransferStatusEnum prev_status,
                                      TransferStatusEnum new_status);
 
-   private:
     struct AllocatedMemory {
         void* addr;
         size_t size;
@@ -238,12 +251,6 @@ class TransferEngineImpl {
         MemoryOptions options;
     };
 
-    struct BatchSet {
-        std::unordered_set<Batch*> active;
-        std::vector<Batch*> freelist;
-    };
-
-   private:
     std::shared_ptr<Config> conf_;
     std::shared_ptr<ControlService> metadata_;
     std::shared_ptr<Topology> topology_;
@@ -254,7 +261,8 @@ class TransferEngineImpl {
         transport_list_;
     std::unique_ptr<SegmentTracker> local_segment_tracker_;
 
-    ThreadLocalStorage<BatchSet> batch_set_;
+    std::mutex batch_registry_mu_;
+    std::unordered_map<BatchID, std::shared_ptr<Batch>> batches_;
 
     std::vector<AllocatedMemory> allocated_memory_;
     std::mutex mutex_;
@@ -270,13 +278,7 @@ class TransferEngineImpl {
     bool enable_auto_failover_on_poll_{true};
     bool enable_progress_worker_{false};
 
-    // Guards alive_batch_generations_ and serializes pollTaskStatus /
-    // updateTaskStatusAfterPoll / lazyFreeBatch against the optional
-    // ProgressWorker thread. Recursive because freeBatch -> lazyFreeBatch ->
-    // getTransferStatus can re-enter on the same thread.
-    std::recursive_mutex progress_mutex_;
-    std::unordered_map<BatchID, uint64_t> alive_batch_generations_;
-    std::atomic<uint64_t> next_batch_generation_{1};
+    std::atomic<BatchID> next_batch_id_{1};
     std::unique_ptr<ProgressWorker> progress_worker_;
 };
 }  // namespace tent

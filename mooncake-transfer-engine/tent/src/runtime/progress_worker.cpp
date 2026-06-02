@@ -33,8 +33,8 @@ void ProgressWorker::stop() {
     if (!running_.exchange(false, std::memory_order_acq_rel)) return;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        // Drop pending work; outstanding batches will be reaped via the
-        // user thread's freeBatch path.
+        // Drop pending work; outstanding batches are owned by the engine
+        // registry and will be reclaimed by freeBatch or engine teardown.
         order_.clear();
         queued_.clear();
     }
@@ -42,22 +42,20 @@ void ProgressWorker::stop() {
     if (thread_.joinable()) thread_.join();
 }
 
-void ProgressWorker::notifyBatchMaybeReady(BatchID batch_id,
-                                           uint64_t generation) {
+void ProgressWorker::notifyBatchMaybeReady(BatchID batch_id) {
     if (!batch_id) return;
     if (!running_.load(std::memory_order_acquire)) return;
-    WorkItem item{batch_id, generation};
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (!queued_.insert(item).second) return;
-        order_.push_back(item);
+        if (!queued_.insert(batch_id).second) return;
+        order_.push_back(batch_id);
     }
     cv_.notify_one();
 }
 
 void ProgressWorker::runner() {
     while (true) {
-        WorkItem item;
+        BatchID batch_id;
         {
             std::unique_lock<std::mutex> lk(mu_);
             cv_.wait(lk, [&] {
@@ -65,17 +63,17 @@ void ProgressWorker::runner() {
                        !order_.empty();
             });
             if (!running_.load(std::memory_order_acquire)) return;
-            item = order_.front();
+            batch_id = order_.front();
             order_.pop_front();
-            queued_.erase(item);
+            queued_.erase(batch_id);
         }
-        // progressBatch acquires the engine's progress_mutex_ and silently
-        // returns InvalidArgument if the batch was freed before we got here.
+        // progressBatchIfAlive validates the batch handle and returns cleanly
+        // if the batch was freed before we got here.
         // PENDING means "kick again later"; the next notify wakes us up.
-        // Terminal states leave the batch alone — freeBatch on the user
-        // thread is responsible for reclamation.
+        // Terminal states leave active batches alone; free-requested batches
+        // are reclaimed by the engine once they reach a terminal state.
         TransferStatus s;
-        (void)impl_->progressBatchIfAlive(item.batch_id, item.generation, s);
+        (void)impl_->progressBatchIfAlive(batch_id, s);
     }
 }
 

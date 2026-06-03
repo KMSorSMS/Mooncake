@@ -611,7 +611,7 @@ PYBIND11_MODULE(tent, m) {
         // batch operations
         // ---------------------------------------------------------------------
         .def("allocate_transfer_batch", &TransferEngine::allocateBatch,
-             py::arg("batch_size"))
+             py::arg("batch_size"), py::arg("enable_failover") = true)
 
         .def(
             "free_transfer_batch",
@@ -626,16 +626,18 @@ PYBIND11_MODULE(tent, m) {
         .def(
             "allocate_batch_guard",
             [](TransferEngine& self,
-               size_t batch_size) -> std::unique_ptr<BatchGuard> {
+               size_t batch_size,
+               bool enable_failover) -> std::unique_ptr<BatchGuard> {
                 py::gil_scoped_release release;
-                auto batch_id = self.allocateBatch(batch_size);
+                auto batch_id = self.allocateBatch(batch_size,
+                                                   enable_failover);
                 if (batch_id == 0) {
                     throw InternalError(
                         "allocate_batch_guard: failed to allocate batch");
                 }
                 return std::make_unique<BatchGuard>(&self, batch_id);
             },
-            py::arg("batch_size"))
+            py::arg("batch_size"), py::arg("enable_failover") = true)
 
         // ---------------------------------------------------------------------
         // submitTransfer overloads

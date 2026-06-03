@@ -126,7 +126,7 @@ class TransferEngineImpl {
                                MemoryOptions& options);
 
    public:
-    BatchID allocateBatch(size_t batch_size);
+    BatchID allocateBatch(size_t batch_size, bool enable_failover = true);
 
     Status freeBatch(BatchID batch_id);
 
@@ -202,6 +202,9 @@ class TransferEngineImpl {
 
     Status pollTaskStatus(Batch* batch, size_t task_id,
                           TransferStatus& task_status);
+
+    void resolveFailedTask(Batch* batch, size_t task_id,
+                           bool allow_failover);
 
     void updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
                                    TransferStatus& task_status,

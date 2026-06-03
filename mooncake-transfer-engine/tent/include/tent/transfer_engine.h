@@ -283,7 +283,7 @@ class TransferEngine {
                                MemoryOptions& options);
 
    public:
-    BatchID allocateBatch(size_t batch_size);
+    BatchID allocateBatch(size_t batch_size, bool enable_failover = true);
 
     Status freeBatch(BatchID batch_id);
 

@@ -80,6 +80,7 @@ struct Batch {
     BatchID id{0};
     std::mutex mu;
     BatchLifecycle lifecycle{BatchLifecycle::ACTIVE};
+    bool failover_enabled{true};  // false => batch never fails over
     std::array<Transport::SubBatchRef, kSupportedTransportTypes> sub_batch;
     std::array<std::shared_ptr<EngineBatchSink>, kSupportedTransportTypes>
         sinks;
@@ -828,8 +829,10 @@ void TransferEngineImpl::reclaimBatchLocked(
     }
 }
 
-BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
+BatchID TransferEngineImpl::allocateBatch(size_t batch_size,
+                                          bool enable_failover) {
     auto batch = std::make_shared<Batch>();
+    batch->failover_enabled = enable_failover;
     batch->max_size = batch_size;
     BatchID batch_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
     if (batch_id == 0)
@@ -1503,31 +1506,41 @@ Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
                                         task_status);
 }
 
+// Precondition: task is a routable failure (status == FAILED, type != UNSPEC).
+// Final disposition of a FAILED task -- the single failover-policy decision
+// point.
+//   batch failover disabled -> terminal FAILED (hard)
+//   observation-only pass   -> stay FAILED, mark failover_pending (soft; a
+//                              later capable pass retries)
+//   failover-capable pass   -> resubmit; PENDING on success, else terminal
+//                              FAILED (failover exhausted)
+void TransferEngineImpl::resolveFailedTask(Batch* batch, size_t task_id,
+                                           bool allow_failover) {
+    auto& task = batch->task_list[task_id];
+    if (!batch->failover_enabled) {
+        task.failover_pending = false;
+        return;
+    }
+    if (!allow_failover) {
+        task.failover_pending = true;
+        return;
+    }
+    task.failover_pending = false;
+    if (resubmitTransferTask(batch, task_id).ok()) task.status = PENDING;
+}
+
 void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
                                                    TransferStatus& task_status,
                                                    bool allow_failover) {
     auto& task = batch->task_list[task_id];
     task.status = task_status.s;
-    // Only a routable transport failure is recoverable via failover.
+    // Only a routable transport failure is eligible for failover.
     if (task_status.s != FAILED || task.type == UNSPEC) {
         task.failover_pending = false;
         return;
     }
-
-    if (!allow_failover) {
-        // Observation-only poll: record a recoverable ("soft") failure that an
-        // explicit progressBatch()/worker pass can still fail over later.
-        task.failover_pending = true;
-        return;
-    }
-
-    if (resubmitTransferTask(batch, task_id).ok()) {
-        task_status.s = PENDING;
-        task.status = PENDING;
-        task.failover_pending = false;
-    } else {
-        task.failover_pending = false;  // failover exhausted -> hard failure
-    }
+    resolveFailedTask(batch, task_id, allow_failover);
+    task_status.s = task.status;  // resolveFailedTask may revive to PENDING
 }
 
 Status TransferEngineImpl::sendNotification(SegmentID target_id,
@@ -1645,15 +1658,9 @@ Status TransferEngineImpl::getBatchStatusLocked(Batch* batch,
         if (task.status != PENDING) {
             // A soft failure recorded by an observation-only status query can
             // still be failed over by a failover-capable progress pass.
-            if (allow_failover && task.status == FAILED &&
-                task.failover_pending) {
-                if (resubmitTransferTask(batch, task_id).ok()) {
-                    task.status = PENDING;
-                    task.failover_pending = false;
-                    continue;  // back in flight; polled on a later pass
-                }
-                task.failover_pending = false;  // failover exhausted -> hard failure
-            }
+            if (task.status == FAILED && task.failover_pending)
+                resolveFailedTask(batch, task_id, allow_failover);
+            if (task.status == PENDING) continue;  // resolveFailedTask revived it
             if (task.status == COMPLETED) {
                 success_tasks++;
                 overall_status.transferred_bytes += task.request.length;

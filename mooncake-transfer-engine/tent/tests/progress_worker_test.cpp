@@ -1073,6 +1073,61 @@ TEST(TransportTerminalEvent, LateSinkAfterFreeDoesNotProgressReusedBatch) {
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
 }
 
+// ---------------------------------------------------------------------------
+// 16. A later freeBatch sweeps earlier free-requested terminal batches even
+//     when the worker is disabled.
+// ---------------------------------------------------------------------------
+
+TEST(BatchLifecycle, FreeSweepsTerminalPendingFreeBatchWithoutWorker) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto completed = std::make_shared<std::atomic<bool>>(false);
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, FakeTransport::StatusFactory{},
+        [completed](const Request& req, int /*poll_count*/) -> TransferStatus {
+            if (completed->load()) {
+                return {TransferStatusEnum::COMPLETED, req.length};
+            }
+            return {TransferStatusEnum::PENDING, 0};
+        });
+
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+
+    constexpr size_t kBufLen = 4096;
+    std::vector<uint8_t> buf(kBufLen, 0xDB);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), kBufLen).ok());
+
+    Request req;
+    req.opcode = Request::WRITE;
+    req.source = buf.data();
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.target_offset = reinterpret_cast<uint64_t>(buf.data());
+    req.length = kBufLen;
+
+    BatchID batch_a = engine.allocateBatch(1);
+    ASSERT_NE(batch_a, (BatchID)0);
+    ASSERT_TRUE(engine.submitTransfer(batch_a, {req}).ok());
+
+    ASSERT_TRUE(engine.freeBatch(batch_a).ok());
+    EXPECT_EQ(fake_rdma->free_calls.load(), 0);
+
+    completed->store(true);
+
+    BatchID batch_b = engine.allocateBatch(1);
+    ASSERT_NE(batch_b, (BatchID)0);
+    ASSERT_TRUE(engine.submitTransfer(batch_b, {req}).ok());
+    ASSERT_TRUE(engine.freeBatch(batch_b).ok());
+
+    EXPECT_EQ(fake_rdma->free_calls.load(), 2)
+        << "freeBatch must sweep the earlier pending-free batch once it is terminal";
+
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

@@ -826,6 +826,34 @@ void TransferEngineImpl::reclaimBatchLocked(
         std::lock_guard<std::mutex> lk(batch_registry_mu_);
         auto it = batches_.find(batch->id);
         if (it != batches_.end() && it->second == batch) batches_.erase(it);
+        free_requested_.erase(batch->id);
+    }
+}
+
+// Reclaim every free-requested batch that has reached a terminal state. Run
+// on each freeBatch so a batch freed while still in flight is collected by a
+// later free (the worker also reclaims such batches when enabled), instead of
+// lingering until engine teardown. One batch is locked at a time.
+void TransferEngineImpl::reclaimTerminalFreeRequestedBatches() {
+    std::vector<std::shared_ptr<Batch>> candidates;
+    {
+        std::lock_guard<std::mutex> lk(batch_registry_mu_);
+        candidates.reserve(free_requested_.size());
+        for (BatchID id : free_requested_) {
+            auto it = batches_.find(id);
+            if (it != batches_.end()) candidates.push_back(it->second);
+        }
+    }
+    for (auto& batch : candidates) {
+        std::unique_lock<std::mutex> lk(batch->mu);
+        if (batch->lifecycle != BatchLifecycle::FREE_REQUESTED) continue;
+        TransferStatus overall_status;
+        if (getBatchStatusLocked(batch.get(), overall_status,
+                                 enable_auto_failover_on_poll_)
+                .ok() &&
+            isTerminalStatus(overall_status.s)) {
+            reclaimBatchLocked(batch);
+        }
     }
 }
 
@@ -845,15 +873,15 @@ BatchID TransferEngineImpl::allocateBatch(size_t batch_size,
 }
 
 Status TransferEngineImpl::freeBatch(BatchID batch_id) {
-    auto held = acquireBatch(batch_id, BatchLookupMode::ACTIVE_ONLY);
-    if (!held)
-        return Status::InvalidArgument("Batch is not alive" LOC_MARK);
-    held.batch->lifecycle = BatchLifecycle::FREE_REQUESTED;
-    TransferStatus overall_status;
-    CHECK_STATUS(getBatchStatusLocked(
-        held.batch.get(), overall_status, enable_auto_failover_on_poll_));
-    if (isTerminalStatus(overall_status.s))
-        reclaimBatchLocked(held.batch);
+    {
+        auto held = acquireBatch(batch_id, BatchLookupMode::ACTIVE_ONLY);
+        if (!held)
+            return Status::InvalidArgument("Batch is not alive" LOC_MARK);
+        held.batch->lifecycle = BatchLifecycle::FREE_REQUESTED;
+        std::lock_guard<std::mutex> rlk(batch_registry_mu_);
+        free_requested_.insert(batch_id);
+    }
+    reclaimTerminalFreeRequestedBatches();
     return Status::OK();
 }
 

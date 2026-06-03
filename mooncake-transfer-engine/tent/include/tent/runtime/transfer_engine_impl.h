@@ -24,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "tent/common/config.h"
@@ -234,6 +235,8 @@ class TransferEngineImpl {
 
     void reclaimBatchLocked(const std::shared_ptr<Batch>& batch);
 
+    void reclaimTerminalFreeRequestedBatches();
+
     SelectionResult resolveTransport(const Request& req, int transport_index,
                                      bool invalidate_on_fail = true);
 
@@ -267,6 +270,9 @@ class TransferEngineImpl {
 
     std::mutex batch_registry_mu_;
     std::unordered_map<BatchID, std::shared_ptr<Batch>> batches_;
+    // Ids of batches whose free was requested but were still in flight; swept
+    // by reclaimTerminalFreeRequestedBatches(). Guarded by batch_registry_mu_.
+    std::unordered_set<BatchID> free_requested_;
 
     std::vector<AllocatedMemory> allocated_memory_;
     std::mutex mutex_;

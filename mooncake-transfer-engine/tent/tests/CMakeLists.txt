@@ -47,6 +47,15 @@ target_include_directories(tent_tcp_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_tcp_transport_test COMMAND tent_tcp_transport_test)
 
+if(TARGET tent_xport_uring)
+  add_executable(tent_iouring_transport_test io_uring_transport_test.cpp)
+  target_link_libraries(tent_iouring_transport_test PRIVATE gtest gtest_main
+                                                           tent_link_group)
+  target_include_directories(tent_iouring_transport_test
+                             PRIVATE /../include)
+  add_test(NAME tent_iouring_transport_test COMMAND tent_iouring_transport_test)
+endif()
+
 add_executable(tent_failover_test failover_test.cpp)
 target_link_libraries(tent_failover_test PRIVATE gtest gtest_main
                                                  tent_link_group)

@@ -18,11 +18,16 @@
 #include <bits/stdint-uintn.h>
 #include <liburing.h>
 
+#include <atomic>
 #include <cstddef>
+#include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
@@ -31,22 +36,38 @@ namespace mooncake {
 namespace tent {
 
 class IOUringFileContext;
+class IOUringReactor;
 
 struct IOUringTask {
-    Request request;
-    volatile TransferStatusEnum status_word;
-    volatile size_t transferred_bytes;
-    void *buffer = nullptr;
+    using OwnedBuffer = std::unique_ptr<void, decltype(&std::free)>;
 
-    ~IOUringTask() {
-        if (buffer) free(buffer);
-    }
+    Request request;
+    std::atomic<TransferStatusEnum> status_word{TransferStatusEnum::PENDING};
+    std::atomic<size_t> transferred_bytes{0};
+    OwnedBuffer buffer;
+
+    IOUringTask() : buffer(nullptr, &std::free) {}
+    IOUringTask(IOUringTask &&other) noexcept
+        : request(other.request),
+          status_word(other.status_word.load(std::memory_order_relaxed)),
+          transferred_bytes(
+              other.transferred_bytes.load(std::memory_order_relaxed)),
+          buffer(std::move(other.buffer)) {}
+    IOUringTask(const IOUringTask &) = delete;
+    IOUringTask &operator=(const IOUringTask &) = delete;
+    IOUringTask &operator=(IOUringTask &&) = delete;
 };
 
 struct IOUringSubBatch : public Transport::SubBatch {
     size_t max_size;
     std::vector<IOUringTask> task_list;
     struct io_uring ring;
+    std::mutex ring_mutex;
+    std::atomic<size_t> pending_cqes{0};
+    // Reactor wiring.
+    int eventfd_{-1};
+    std::atomic<bool> registered{false};
+    std::atomic<bool> dispatch_pending{false};
     virtual size_t size() const { return task_list.size(); }
 };
 
@@ -62,6 +83,8 @@ class IOUringTransport : public Transport {
                            std::shared_ptr<Config> conf = nullptr);
 
     virtual Status uninstall();
+
+    virtual Status drain() override;
 
     virtual Status allocateSubBatch(SubBatchRef &batch, size_t max_size);
 
@@ -87,12 +110,23 @@ class IOUringTransport : public Transport {
 
     Status probeCapabilities();
 
+   public:
+    // Visible to IOUringReactor; returns true iff the CQE produced a terminal
+    // state transition (so callers know to fire notifyTerminal once per drain).
+    static bool processCompletionStatic(IOUringSubBatch *batch,
+                                        struct io_uring_cqe *cqe);
+
    private:
     bool installed_;
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<ControlService> metadata_;
     std::shared_ptr<Config> conf_;
+
+    std::unique_ptr<IOUringReactor> reactor_;
+
+    std::mutex allocated_batches_mutex_;
+    std::unordered_set<IOUringSubBatch *> allocated_batches_;
 
     RWSpinlock file_context_lock_;
     using FileContextMap =

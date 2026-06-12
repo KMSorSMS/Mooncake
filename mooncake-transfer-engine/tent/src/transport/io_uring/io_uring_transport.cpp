@@ -91,22 +91,17 @@ Status IOUringTransport::install(std::string& local_segment_name,
     local_topology_ = local_topology;
     conf_ = conf;
 
-    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-    const int default_workers = std::max(2, static_cast<int>(hw / 4));
-    const int workers =
+    // CQE draining is microsecond-scale work per entry; the only heavy part
+    // is the bounce-buffer copy-back, so a small pool suffices. The reactor
+    // and its workers start lazily on first allocateSubBatch so a process
+    // that never issues io_uring transfers pays no thread footprint.
+    constexpr int kDefaultReactorWorkers = 2;
+    reactor_workers_ =
         conf_ ? conf_->get<int>("transports/io_uring/reactor_workers",
-                                default_workers)
-              : default_workers;
-    reactor_ = std::make_unique<IOUringReactor>();
-    auto rs = reactor_->start(static_cast<size_t>(workers));
-    if (!rs.ok()) {
-        reactor_.reset();
-        return rs;
-    }
+                                kDefaultReactorWorkers)
+              : kDefaultReactorWorkers;
 
     installed_ = true;
-    async_memcpy_threshold_ =
-        conf_->get("transports/nvlink/async_memcpy_threshold", 1024) * 1024;
     caps.dram_to_file = true;
     if (Platform::getLoader().type() != "cpu") {
         caps.gpu_to_file = true;
@@ -161,7 +156,20 @@ Status IOUringTransport::drain() {
     return Status::OK();
 }
 
+Status IOUringTransport::ensureReactorStarted() {
+    std::lock_guard<std::mutex> lk(reactor_mutex_);
+    if (reactor_) return Status::OK();
+    auto reactor = std::make_unique<IOUringReactor>();
+    auto rs = reactor->start(static_cast<size_t>(reactor_workers_));
+    if (!rs.ok()) return rs;   // retryable on the next allocate
+    reactor_ = std::move(reactor);
+    return Status::OK();
+}
+
 Status IOUringTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
+    auto rs = ensureReactorStarted();
+    if (!rs.ok()) return rs;
+
     auto io_uring_batch = Slab<IOUringSubBatch>::Get().allocate();
     if (!io_uring_batch)
         return Status::InternalError("Unable to allocate IO Uring sub-batch");
@@ -196,17 +204,15 @@ Status IOUringTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
             std::string("io_uring_register_eventfd failed: ") + strerror(-rc) +
             LOC_MARK);
     }
-    if (reactor_) {
-        auto rs = reactor_->registerBatch(io_uring_batch);
-        if (!rs.ok()) {
-            io_uring_unregister_eventfd(&io_uring_batch->ring);
-            ::close(io_uring_batch->eventfd_);
-            io_uring_batch->eventfd_ = -1;
-            io_uring_queue_exit(&io_uring_batch->ring);
-            Slab<IOUringSubBatch>::Get().deallocate(io_uring_batch);
-            batch = nullptr;
-            return rs;
-        }
+    rs = reactor_->registerBatch(io_uring_batch);
+    if (!rs.ok()) {
+        io_uring_unregister_eventfd(&io_uring_batch->ring);
+        ::close(io_uring_batch->eventfd_);
+        io_uring_batch->eventfd_ = -1;
+        io_uring_queue_exit(&io_uring_batch->ring);
+        Slab<IOUringSubBatch>::Get().deallocate(io_uring_batch);
+        batch = nullptr;
+        return rs;
     }
     {
         std::lock_guard<std::mutex> lock(allocated_batches_mutex_);
@@ -219,11 +225,44 @@ Status IOUringTransport::freeSubBatch(SubBatchRef& batch) {
     auto io_uring_batch = dynamic_cast<IOUringSubBatch*>(batch);
     if (!io_uring_batch)
         return Status::InvalidArgument("Invalid IO Uring sub-batch" LOC_MARK);
+
+    // 1. Detach from the reactor and wait out any worker task (covers its
+    //    notifyTerminal). On timeout, leak the batch rather than free it.
+    if (reactor_ && !reactor_->unregisterBatch(io_uring_batch)) {
+        return Status::InternalError(
+            "io_uring batch still has an active reactor worker" LOC_MARK);
+    }
+
+    // 2. Retire in-flight IO. io_uring_queue_exit does not cancel in-flight
+    //    requests, and the kernel DMAs into the bounce buffers owned by
+    //    task_list -- they must not be freed until every CQE has landed.
+    //    The reactor no longer watches this batch, so reap here ourselves.
+    //    io_uring_submit flushes any SQEs a failed submit left queued, so
+    //    their CQEs (already counted in pending_cqes) can arrive.
+    constexpr auto kReapTimeout = std::chrono::seconds(5);
+    const auto deadline = std::chrono::steady_clock::now() + kReapTimeout;
+    std::vector<HarvestedCqe> done;
+    while (io_uring_batch->pending_cqes.load(std::memory_order_acquire) > 0) {
+        done.clear();
+        {
+            std::lock_guard<std::mutex> lk(io_uring_batch->ring_mutex);
+            (void)io_uring_submit(&io_uring_batch->ring);
+            harvestCompletionsLocked(io_uring_batch, done);
+        }
+        for (const auto& h : done) finalizeCompletion(io_uring_batch, h);
+        if (io_uring_batch->pending_cqes.load(std::memory_order_acquire) == 0)
+            break;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return Status::InternalError(
+                "io_uring batch still has in-flight IO" LOC_MARK);
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+
     {
         std::lock_guard<std::mutex> lock(allocated_batches_mutex_);
         allocated_batches_.erase(io_uring_batch);
     }
-    if (reactor_) reactor_->unregisterBatch(io_uring_batch);
     if (io_uring_batch->eventfd_ >= 0) {
         io_uring_unregister_eventfd(&io_uring_batch->ring);
         ::close(io_uring_batch->eventfd_);
@@ -274,28 +313,25 @@ Status IOUringTransport::submitTransferTasks(
     auto io_uring_batch = dynamic_cast<IOUringSubBatch*>(batch);
     if (!io_uring_batch)
         return Status::InvalidArgument("Invalid IO Uring sub-batch" LOC_MARK);
-    if (request_list.size() + (int)io_uring_batch->task_list.size() >
-        io_uring_batch->max_size)
-        return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
-    // Hold ring_mutex across SQE prep + submit so we serialize against the
-    // reactor-dispatched worker that drains CQEs on the same ring.
-    std::lock_guard<std::mutex> ring_lk(io_uring_batch->ring_mutex);
-    for (auto& request : request_list) {
-        io_uring_batch->task_list.emplace_back();
-        auto& task = io_uring_batch->task_list.back();
-        task.request = request;
-        task.status_word.store(TransferStatusEnum::PENDING,
-                               std::memory_order_release);
-        task.transferred_bytes.store(0, std::memory_order_release);
 
+    // Phase 1: validate and stage everything private (file contexts, bounce
+    // buffers, WRITE copy-in) before taking ring_mutex, so the lock never
+    // covers a large memcpy and a failure here leaves no shared state to
+    // unwind.
+    struct StagedRequest {
+        const Request* req;
+        IOUringFileContext* context;
+        IOUringTask::OwnedBuffer bounce{nullptr, &std::free};
+    };
+    std::vector<StagedRequest> staged;
+    staged.reserve(request_list.size());
+    for (auto& request : request_list) {
+        if (request.opcode != Request::READ && request.opcode != Request::WRITE)
+            return Status::InvalidArgument("Unsupported opcode" LOC_MARK);
         IOUringFileContext* context = findFileContext(request.target_id);
         if (!context || !context->ready())
             return Status::InvalidArgument("Invalid remote segment" LOC_MARK);
-
-        struct io_uring_sqe* sqe = io_uring_get_sqe(&io_uring_batch->ring);
-        if (!sqe)
-            return Status::InternalError("io_uring_get_sqe failed" LOC_MARK);
-
+        StagedRequest s{&request, context};
         const size_t kPageSize = 4096;
         if (Platform::getLoader().getMemoryType(request.source) == MTYPE_CUDA ||
             (uint64_t)request.source % kPageSize) {
@@ -303,54 +339,86 @@ Status IOUringTransport::submitTransferTasks(
             int rc = posix_memalign(&aligned_buffer, kPageSize, request.length);
             if (rc)
                 return Status::InternalError("posix_memalign failed" LOC_MARK);
-            task.buffer.reset(aligned_buffer);
-
-            if (request.opcode == Request::READ)
-                io_uring_prep_read(sqe, context->getHandle(),
-                                   task.buffer.get(),
-                                   request.length, request.target_offset);
-            else if (request.opcode == Request::WRITE) {
-                Platform::getLoader().copy(task.buffer.get(), request.source,
+            s.bounce.reset(aligned_buffer);
+            if (request.opcode == Request::WRITE)
+                Platform::getLoader().copy(s.bounce.get(), request.source,
                                            request.length);
-                io_uring_prep_write(sqe, context->getHandle(),
-                                    task.buffer.get(),
-                                    request.length, request.target_offset);
-            }
-        } else {
-            if (request.opcode == Request::READ)
-                io_uring_prep_read(sqe, context->getHandle(), request.source,
-                                   request.length, request.target_offset);
-            else if (request.opcode == Request::WRITE)
-                io_uring_prep_write(sqe, context->getHandle(), request.source,
-                                    request.length, request.target_offset);
         }
+        staged.push_back(std::move(s));
+    }
+
+    // Phase 2: publish into the ring. Everything under the lock is
+    // microsecond-scale; it serializes against the reactor worker draining
+    // CQEs on the same ring.
+    std::lock_guard<std::mutex> ring_lk(io_uring_batch->ring_mutex);
+    if (staged.size() + io_uring_batch->task_list.size() >
+        io_uring_batch->max_size)
+        return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
+    const size_t first_new_task = io_uring_batch->task_list.size();
+    const unsigned saved_sqe_tail = io_uring_batch->ring.sq.sqe_tail;
+    for (auto& s : staged) {
+        io_uring_batch->task_list.emplace_back();
+        auto& task = io_uring_batch->task_list.back();
+        task.request = *s.req;
+        task.buffer = std::move(s.bounce);
+
+        auto sqe = io_uring_get_sqe(&io_uring_batch->ring);
+        if (!sqe) {
+            // Discard prepped-but-unflushed SQEs and their tasks; nothing has
+            // reached the kernel, so no user_data is live.
+            io_uring_batch->ring.sq.sqe_tail = saved_sqe_tail;
+            io_uring_batch->task_list.resize(first_new_task);
+            return Status::InternalError("io_uring SQ full" LOC_MARK);
+        }
+        void* buf = task.buffer ? task.buffer.get() : task.request.source;
+        if (task.request.opcode == Request::READ)
+            io_uring_prep_read(sqe, s.context->getHandle(), buf,
+                               task.request.length, task.request.target_offset);
+        else
+            io_uring_prep_write(sqe, s.context->getHandle(), buf,
+                                task.request.length,
+                                task.request.target_offset);
         sqe->user_data = (uintptr_t)&task;
     }
 
-    // Account for in-flight CQEs before submit so a fast completion racing the
-    // submitter still observes a non-zero counter.
-    io_uring_batch->pending_cqes.fetch_add(request_list.size(),
+    // Count in-flight CQEs before submit so a completion racing the submitter
+    // still observes a non-zero counter. Never decrement on failure: once
+    // io_uring_submit is called the prepped SQEs are flushed into the
+    // kernel-visible SQ ring and WILL each produce a CQE once a later submit
+    // (or freeSubBatch's reap loop) hands them to the kernel.
+    io_uring_batch->pending_cqes.fetch_add(staged.size(),
                                            std::memory_order_acq_rel);
     int rc = io_uring_submit(&io_uring_batch->ring);
-    if (rc != (int32_t)request_list.size()) {
-        // Roll the counter back; the failed SQEs will never produce CQEs.
-        io_uring_batch->pending_cqes.fetch_sub(request_list.size(),
-                                               std::memory_order_acq_rel);
+    if (rc < 0) {
         return Status::InternalError(std::string("io_uring_submit failed: ") +
                                      strerror(-rc) + LOC_MARK);
+    }
+    if ((size_t)rc < staged.size()) {
+        LOG(WARNING) << "io_uring_submit consumed " << rc << "/"
+                     << staged.size()
+                     << " SQEs; remainder stays queued";
+        return Status::InternalError("partial io_uring_submit" LOC_MARK);
     }
     return Status::OK();
 }
 
-bool IOUringTransport::processCompletionStatic(IOUringSubBatch* batch,
-                                                struct io_uring_cqe* cqe) {
-    if (!batch || !cqe) return false;
-    auto* task = reinterpret_cast<IOUringTask*>(cqe->user_data);
-    if (!task) return false;
+void IOUringTransport::harvestCompletionsLocked(
+    IOUringSubBatch* batch, std::vector<HarvestedCqe>& out) {
+    struct io_uring_cqe* cqe = nullptr;
+    while (io_uring_peek_cqe(&batch->ring, &cqe) == 0 && cqe) {
+        auto* task = reinterpret_cast<IOUringTask*>(cqe->user_data);
+        if (task) out.push_back({task, cqe->res});
+        io_uring_cqe_seen(&batch->ring, cqe);
+        cqe = nullptr;
+    }
+}
 
+bool IOUringTransport::finalizeCompletion(IOUringSubBatch* batch,
+                                          const HarvestedCqe& h) {
+    auto* task = h.task;
     TransferStatusEnum final_status = TransferStatusEnum::COMPLETED;
-    if (cqe->res < 0) {
-        LOG(INFO) << "Received an event with error code " << cqe->res;
+    if (h.res < 0) {
+        LOG(INFO) << "Received an event with error code " << h.res;
         final_status = TransferStatusEnum::FAILED;
     } else {
         if (task->buffer) {
@@ -376,33 +444,27 @@ bool IOUringTransport::processCompletionStatic(IOUringSubBatch* batch,
 Status IOUringTransport::getTransferStatus(SubBatchRef batch, int task_id,
                                            TransferStatus& status) {
     auto io_uring_batch = dynamic_cast<IOUringSubBatch*>(batch);
+    if (!io_uring_batch)
+        return Status::InvalidArgument("Invalid IO Uring sub-batch" LOC_MARK);
     if (task_id < 0 || task_id >= (int)io_uring_batch->task_list.size())
         return Status::InvalidArgument("Invalid task ID");
     auto& task = io_uring_batch->task_list[task_id];
     status = TransferStatus{
         task.status_word.load(std::memory_order_acquire),
         task.transferred_bytes.load(std::memory_order_acquire)};
-    // Fallback peek path: only when the user hasn't installed a sink. With a
-    // sink, the reactor + worker pool drives completion and we must not race
-    // against them on the same ring.
+    // Fallback reap for batches without a sink: such callers have no event
+    // path and rely on polling for completions to be processed. The reactor
+    // also drains this ring; ring_mutex and the PENDING->terminal CAS make
+    // the two reapers safe to coexist.
     if (task.status_word.load(std::memory_order_acquire) ==
             TransferStatusEnum::PENDING &&
         !io_uring_batch->sink) {
-        struct io_uring_cqe* cqe = nullptr;
-        std::lock_guard<std::mutex> lock(io_uring_batch->ring_mutex);
-        bool any_terminal = false;
-        while (true) {
-            cqe = nullptr;
-            int err = io_uring_peek_cqe(&io_uring_batch->ring, &cqe);
-            if (err == -EAGAIN || !cqe) break;
-            if (err) {
-                return Status::InternalError(
-                    std::string("io_uring_peek_cqe failed: ") + strerror(-err));
-            }
-            if (processCompletionStatic(io_uring_batch, cqe)) any_terminal = true;
-            io_uring_cqe_seen(&io_uring_batch->ring, cqe);
+        std::vector<HarvestedCqe> done;
+        {
+            std::lock_guard<std::mutex> lock(io_uring_batch->ring_mutex);
+            harvestCompletionsLocked(io_uring_batch, done);
         }
-        (void)any_terminal;  // no sink to notify
+        for (const auto& h : done) finalizeCompletion(io_uring_batch, h);
         status = TransferStatus{
             task.status_word.load(std::memory_order_acquire),
             task.transferred_bytes.load(std::memory_order_acquire)};

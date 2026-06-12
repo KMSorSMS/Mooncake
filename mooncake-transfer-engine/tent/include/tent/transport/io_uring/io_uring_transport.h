@@ -47,6 +47,9 @@ struct IOUringTask {
     OwnedBuffer buffer;
 
     IOUringTask() : buffer(nullptr, &std::free) {}
+    // Move support exists only to satisfy std::vector; task_list reserves
+    // max_size up front and submitTransferTasks enforces the cap, so tasks
+    // never relocate while their address is registered as SQE user_data.
     IOUringTask(IOUringTask &&other) noexcept
         : request(other.request),
           status_word(other.status_word.load(std::memory_order_relaxed)),
@@ -68,10 +71,16 @@ struct IOUringSubBatch : public Transport::SubBatch {
     int eventfd_{-1};
     std::atomic<bool> registered{false};
     std::atomic<bool> dispatch_pending{false};
+    // Number of reactor worker tasks currently executing drainCompletions for
+    // this batch. Unlike dispatch_pending (single-flight dedup), this covers
+    // the whole task including notifyTerminal; unregisterBatch barriers on it.
+    std::atomic<int> active_workers{0};
     virtual size_t size() const { return task_list.size(); }
 };
 
 class IOUringTransport : public Transport {
+    friend class IOUringReactor;
+
    public:
     IOUringTransport();
 
@@ -103,6 +112,8 @@ class IOUringTransport : public Transport {
 
     virtual const char *getName() const { return "io-uring"; }
 
+    bool reactorStartedForTest() const { return reactor_ != nullptr; }
+
    private:
     std::string getIOUringFilePath(SegmentID handle);
 
@@ -110,11 +121,21 @@ class IOUringTransport : public Transport {
 
     Status probeCapabilities();
 
-   public:
-    // Visible to IOUringReactor; returns true iff the CQE produced a terminal
-    // state transition (so callers know to fire notifyTerminal once per drain).
-    static bool processCompletionStatic(IOUringSubBatch *batch,
-                                        struct io_uring_cqe *cqe);
+    Status ensureReactorStarted();
+
+    struct HarvestedCqe {
+        IOUringTask *task;
+        int res;
+    };
+    // Drains every currently-ready CQE into `out`. Caller holds ring_mutex.
+    static void harvestCompletionsLocked(IOUringSubBatch *batch,
+                                         std::vector<HarvestedCqe> &out);
+    // Completes a harvested CQE: bounce copy-back, status transition,
+    // accounting. Needs no lock -- once its CQE is consumed the kernel no
+    // longer references the task, and the buffers involved are private.
+    // Returns true iff the task reached a terminal state.
+    static bool finalizeCompletion(IOUringSubBatch *batch,
+                                   const HarvestedCqe &h);
 
    private:
     bool installed_;
@@ -124,6 +145,11 @@ class IOUringTransport : public Transport {
     std::shared_ptr<Config> conf_;
 
     std::unique_ptr<IOUringReactor> reactor_;
+    // reactor_ is created on first allocateSubBatch (ensureReactorStarted)
+    // and stays until uninstall(); every path that can observe an allocated
+    // batch is ordered after the allocate that started the reactor.
+    std::mutex reactor_mutex_;
+    int reactor_workers_{0};
 
     std::mutex allocated_batches_mutex_;
     std::unordered_set<IOUringSubBatch *> allocated_batches_;
@@ -132,7 +158,6 @@ class IOUringTransport : public Transport {
     using FileContextMap =
         std::unordered_map<SegmentID, std::shared_ptr<IOUringFileContext>>;
     FileContextMap file_context_map_;
-    uint64_t async_memcpy_threshold_;
 };
 }  // namespace tent
 }  // namespace mooncake

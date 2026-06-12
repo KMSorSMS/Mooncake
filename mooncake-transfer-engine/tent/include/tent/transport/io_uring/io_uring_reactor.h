@@ -38,7 +38,8 @@ struct IOUringSubBatch;
 // CQEs in a single pass under the batch's ring_mutex.
 //
 // Single-flight dispatch is enforced through IOUringSubBatch::dispatch_pending,
-// so at most one worker task per batch is in flight at any time.
+// so at most one worker task per batch is in flight at any time. Lifetime
+// barriers use IOUringSubBatch::active_workers, which covers the whole worker.
 class IOUringReactor {
    public:
     IOUringReactor() = default;
@@ -53,15 +54,15 @@ class IOUringReactor {
     // Adds the batch to the epoll set keyed by its eventfd.
     Status registerBatch(IOUringSubBatch* batch);
 
-    // Removes the batch and returns only after no reactor thread or worker
-    // task can still touch it. After this call the batch's ring/eventfd may
-    // safely be torn down.
-    void unregisterBatch(IOUringSubBatch* batch);
+    // Removes the batch and returns true when no reactor thread or worker task
+    // can still touch it. False means the barrier timed out and the caller must
+    // not destroy the batch.
+    bool unregisterBatch(IOUringSubBatch* batch);
 
    private:
     void reactorLoop();
     void dispatch(IOUringSubBatch* batch);
-    static void drainCompletions(IOUringSubBatch* batch);
+    static void drainCompletions(IOUringSubBatch* batch) noexcept;
 
     int epoll_fd_ = -1;
     int control_fd_ = -1;

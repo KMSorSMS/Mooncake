@@ -154,11 +154,13 @@ class IOUringTransportTest : public ::testing::Test {
     }
 
     bool waitUntilCompleted(TransferStatus& status,
-                            std::chrono::milliseconds timeout) {
+                            std::chrono::milliseconds timeout,
+                            int task_id = 0) {
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         while (std::chrono::steady_clock::now() < deadline) {
             status = {};
-            if (!transport_.getTransferStatus(active_batch_, 0, status).ok()) {
+            if (!transport_.getTransferStatus(active_batch_, task_id, status)
+                     .ok()) {
                 return false;
             }
             if (status.s != TransferStatusEnum::PENDING) {
@@ -214,6 +216,19 @@ TEST_F(IOUringTransportTest, EventDrivenSubmitNotifiesAndDrainCompletes) {
     EXPECT_EQ(io_batch_->pending_cqes.load(std::memory_order_acquire), 0u);
 }
 
+TEST_F(IOUringTransportTest, ReactorStartsLazilyOnFirstAllocate) {
+    EXPECT_FALSE(transport_.reactorStartedForTest())
+        << "install() must not spawn reactor threads";
+    AllocateBatch();
+    EXPECT_TRUE(transport_.reactorStartedForTest());
+    auto* batch_ref = active_batch_;
+    ASSERT_TRUE(transport_.freeSubBatch(batch_ref).ok());
+    active_batch_ = nullptr;
+    io_batch_ = nullptr;
+    EXPECT_TRUE(transport_.reactorStartedForTest())
+        << "reactor persists until uninstall";
+}
+
 TEST_F(IOUringTransportTest, GetTransferStatusFallsBackWithoutSink) {
     AllocateBatch();
 
@@ -235,6 +250,29 @@ TEST_F(IOUringTransportTest, GetTransferStatusFallsBackWithoutSink) {
     EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
     EXPECT_EQ(status.transferred_bytes, kTransferSize);
     EXPECT_EQ(readFile(kTransferSize), expected);
+}
+
+TEST_F(IOUringTransportTest, FallbackReapsUnalignedReadWithoutSink) {
+    AllocateBatch();
+    auto on_disk = makePattern(kTransferSize, 0x66);
+    writeFile(on_disk);
+    // Unaligned destination forces the bounce path; with no sink installed the
+    // poll-side fallback must harvest the CQE and copy the data back.
+    std::vector<uint8_t> dest(kTransferSize + 1, 0);
+    Request request{};
+    request.opcode = Request::READ;
+    request.source = dest.data() + 1;
+    request.target_id = target_segment_id_;
+    request.target_offset = 0;
+    request.length = kTransferSize;
+    ASSERT_TRUE(transport_.submitTransferTasks(active_batch_, {request}).ok());
+    TransferStatus status{};
+    ASSERT_TRUE(waitUntilCompleted(status, std::chrono::milliseconds(2000)));
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    auto actual =
+        std::vector<uint8_t>(dest.begin() + 1,
+                             dest.begin() + 1 + kTransferSize);
+    EXPECT_EQ(actual, on_disk);
 }
 
 TEST_F(IOUringTransportTest, ReadOpcodeRoundTrip) {
@@ -264,6 +302,79 @@ TEST_F(IOUringTransportTest, ReadOpcodeRoundTrip) {
     EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
     EXPECT_EQ(status.transferred_bytes, kTransferSize);
     EXPECT_EQ(dest, on_disk);
+}
+
+TEST_F(IOUringTransportTest, ReactorDrivenLargeUnalignedReads) {
+    constexpr size_t kChunk = 256 * 1024;
+    constexpr int kRequests = 4;
+
+    const int fd = open(temp_path_.c_str(), O_WRONLY);
+    ASSERT_GE(fd, 0) << std::strerror(errno);
+    ASSERT_EQ(ftruncate(fd, static_cast<off_t>(kRequests * kChunk)), 0)
+        << std::strerror(errno);
+
+    std::vector<std::vector<uint8_t>> patterns(kRequests);
+    for (int i = 0; i < kRequests; ++i) {
+        patterns[i] = makePattern(kChunk, static_cast<uint8_t>(0x30 + i));
+        const ssize_t written =
+            pwrite(fd, patterns[i].data(), patterns[i].size(),
+                   static_cast<off_t>(i * kChunk));
+        ASSERT_EQ(written, static_cast<ssize_t>(patterns[i].size()))
+            << std::strerror(errno);
+    }
+    ASSERT_EQ(close(fd), 0) << std::strerror(errno);
+
+    AllocateBatch(kRequests);
+    auto sink = std::make_shared<CountingSink>();
+    active_batch_->sink = sink;
+
+    std::vector<std::vector<uint8_t>> dests(kRequests);
+    std::vector<Request> requests;
+    requests.reserve(kRequests);
+    for (int i = 0; i < kRequests; ++i) {
+        dests[i].resize(kChunk + 1);
+        Request r{};
+        r.opcode = Request::READ;
+        r.source = dests[i].data() + 1;
+        r.target_id = target_segment_id_;
+        r.target_offset = static_cast<uint64_t>(i * kChunk);
+        r.length = kChunk;
+        requests.push_back(r);
+    }
+
+    ASSERT_TRUE(transport_.submitTransferTasks(active_batch_, requests).ok());
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool all_done = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        int done = 0;
+        for (int i = 0; i < kRequests; ++i) {
+            TransferStatus s{};
+            ASSERT_TRUE(transport_.getTransferStatus(active_batch_, i, s).ok());
+            if (s.s == TransferStatusEnum::COMPLETED) ++done;
+        }
+        if (done == kRequests) {
+            all_done = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    ASSERT_TRUE(all_done);
+
+    for (int i = 0; i < kRequests; ++i) {
+        auto actual =
+            std::vector<uint8_t>(dests[i].begin() + 1,
+                                 dests[i].begin() + 1 + kChunk);
+        EXPECT_EQ(actual, patterns[i]);
+    }
+    EXPECT_EQ(io_batch_->pending_cqes.load(std::memory_order_acquire), 0u);
+
+    auto* batch_ref = active_batch_;
+    ASSERT_TRUE(transport_.freeSubBatch(batch_ref).ok());
+    EXPECT_EQ(batch_ref, nullptr);
+    active_batch_ = nullptr;
+    io_batch_ = nullptr;
 }
 
 TEST_F(IOUringTransportTest, DrainAllowsCleanFreeAndReallocate) {
@@ -472,6 +583,183 @@ TEST_F(IOUringTransportTest, ReactorDispatchesAcrossManyBatches) {
     // Override fixture's TearDown active_batch_ since we managed our own.
     active_batch_ = nullptr;
     io_batch_ = nullptr;
+}
+
+TEST_F(IOUringTransportTest, ReactorDrivesManyCompletionsAcrossRounds) {
+    constexpr int kRounds = 20;
+    constexpr int kRequests = 8;
+
+    const int fd = open(temp_path_.c_str(), O_WRONLY);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(ftruncate(fd, static_cast<off_t>(kRequests * kTransferSize)), 0);
+    ASSERT_EQ(close(fd), 0);
+
+    for (int round = 0; round < kRounds; ++round) {
+        AllocateBatch(kRequests);
+
+        auto sink = std::make_shared<CountingSink>();
+        active_batch_->sink = sink;
+
+        std::vector<std::vector<uint8_t>> storages(kRequests);
+        std::vector<Request> requests;
+        requests.reserve(kRequests);
+        for (int i = 0; i < kRequests; ++i) {
+            storages[i] = makePattern(kTransferSize + 1,
+                                      static_cast<uint8_t>(0x20 + round + i));
+            Request r{};
+            r.opcode = Request::WRITE;
+            r.source = storages[i].data() + 1;
+            r.target_id = target_segment_id_;
+            r.target_offset = static_cast<uint64_t>(i * kTransferSize);
+            r.length = kTransferSize;
+            requests.push_back(r);
+        }
+
+        ASSERT_TRUE(transport_.submitTransferTasks(active_batch_, requests).ok());
+
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        bool all_done = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            int done = 0;
+            for (int i = 0; i < kRequests; ++i) {
+                TransferStatus s{};
+                ASSERT_TRUE(transport_.getTransferStatus(active_batch_, i, s)
+                                .ok());
+                if (s.s == TransferStatusEnum::COMPLETED) ++done;
+            }
+            if (done == kRequests) {
+                all_done = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        ASSERT_TRUE(all_done) << "round " << round << " stranded a CQE";
+        ASSERT_EQ(io_batch_->pending_cqes.load(std::memory_order_acquire), 0u);
+
+        auto* batch_ref = active_batch_;
+        ASSERT_TRUE(transport_.freeSubBatch(batch_ref).ok());
+        EXPECT_EQ(batch_ref, nullptr);
+        active_batch_ = nullptr;
+        io_batch_ = nullptr;
+    }
+}
+
+TEST_F(IOUringTransportTest, FreeWaitsForInFlightIo) {
+    constexpr int kIterations = 20;
+
+    for (int i = 0; i < kIterations; ++i) {
+        AllocateBatch();
+
+        auto storage = makePattern(kTransferSize + 1,
+                                   static_cast<uint8_t>(0x40 + i));
+        auto expected = std::vector<uint8_t>(
+            storage.begin() + 1, storage.begin() + 1 + kTransferSize);
+
+        Request request{};
+        request.opcode = Request::WRITE;
+        request.source = storage.data() + 1;
+        request.target_id = target_segment_id_;
+        request.target_offset = 0;
+        request.length = kTransferSize;
+
+        ASSERT_TRUE(transport_.submitTransferTasks(active_batch_, {request}).ok());
+
+        auto* batch_ref = active_batch_;
+        ASSERT_TRUE(transport_.freeSubBatch(batch_ref).ok());
+        EXPECT_EQ(batch_ref, nullptr);
+        active_batch_ = nullptr;
+        io_batch_ = nullptr;
+
+        ASSERT_EQ(readFile(kTransferSize), expected);
+    }
+}
+
+TEST_F(IOUringTransportTest, FreeReapsInFlightUnalignedRead) {
+    constexpr int kIterations = 10;
+    for (int i = 0; i < kIterations; ++i) {
+        AllocateBatch();
+        auto on_disk = makePattern(kTransferSize,
+                                   static_cast<uint8_t>(0x50 + i));
+        writeFile(on_disk);
+        std::vector<uint8_t> dest(kTransferSize + 1, 0);
+        Request request{};
+        request.opcode = Request::READ;
+        request.source = dest.data() + 1;
+        request.target_id = target_segment_id_;
+        request.target_offset = 0;
+        request.length = kTransferSize;
+        ASSERT_TRUE(transport_.submitTransferTasks(active_batch_, {request}).ok());
+        // Free immediately: the reap loop must wait for the CQE and its
+        // finalize must copy the bounce back into dest before teardown.
+        auto* batch_ref = active_batch_;
+        ASSERT_TRUE(transport_.freeSubBatch(batch_ref).ok());
+        EXPECT_EQ(batch_ref, nullptr);
+        active_batch_ = nullptr;
+        io_batch_ = nullptr;
+        auto actual =
+            std::vector<uint8_t>(dest.begin() + 1,
+                                 dest.begin() + 1 + kTransferSize);
+        ASSERT_EQ(actual, on_disk) << "iteration " << i;
+    }
+}
+
+TEST_F(IOUringTransportTest, MidBatchFailureLeavesBatchUsable) {
+    AllocateBatch(/*capacity=*/4);
+
+    auto bad_storage = makePattern(kTransferSize + 1, 0x60);
+    Request valid{};
+    valid.opcode = Request::WRITE;
+    valid.source = bad_storage.data() + 1;
+    valid.target_id = target_segment_id_;
+    valid.target_offset = 0;
+    valid.length = kTransferSize;
+
+    Request invalid = valid;
+    invalid.target_id = static_cast<SegmentID>(0x7fffffff);
+
+    auto failed = transport_.submitTransferTasks(active_batch_, {valid, invalid});
+    ASSERT_FALSE(failed.ok());
+    ASSERT_TRUE(io_batch_->task_list.empty());
+    ASSERT_EQ(io_batch_->pending_cqes.load(std::memory_order_acquire), 0u);
+
+    auto storage = makePattern(kTransferSize + 1, 0x70);
+    auto expected =
+        std::vector<uint8_t>(storage.begin() + 1,
+                             storage.begin() + 1 + kTransferSize);
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = storage.data() + 1;
+    request.target_id = target_segment_id_;
+    request.target_offset = 0;
+    request.length = kTransferSize;
+
+    ASSERT_TRUE(transport_.submitTransferTasks(active_batch_, {request}).ok());
+
+    TransferStatus status{};
+    ASSERT_TRUE(waitUntilCompleted(status, std::chrono::milliseconds(5000)));
+    ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    ASSERT_EQ(readFile(kTransferSize), expected);
+}
+
+TEST_F(IOUringTransportTest, RejectsUnsupportedOpcode) {
+    AllocateBatch(/*capacity=*/2);
+    auto storage = makePattern(kTransferSize + 1, 0x55);
+    Request bad{};
+    bad.opcode = static_cast<Request::OpCode>(0x7eadbeef);
+    bad.source = storage.data() + 1;
+    bad.target_id = target_segment_id_;
+    bad.target_offset = 0;
+    bad.length = kTransferSize;
+    ASSERT_FALSE(transport_.submitTransferTasks(active_batch_, {bad}).ok());
+    ASSERT_TRUE(io_batch_->task_list.empty());
+    ASSERT_EQ(io_batch_->pending_cqes.load(std::memory_order_acquire), 0u);
+    Request good = bad;
+    good.opcode = Request::WRITE;
+    ASSERT_TRUE(transport_.submitTransferTasks(active_batch_, {good}).ok());
+    TransferStatus status{};
+    ASSERT_TRUE(waitUntilCompleted(status, std::chrono::milliseconds(5000)));
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
 }
 
 }  // namespace
